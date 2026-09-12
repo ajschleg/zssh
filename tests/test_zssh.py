@@ -66,6 +66,26 @@ class TestHostBook(CliTestCase):
         self.assertEqual(self.zssh("rm", "web").returncode, 0)
         self.assertEqual(json.loads(self.zssh("list", "--json").stdout), {})
 
+    def test_add_without_a_name_derives_one_from_the_host(self):
+        out = self.zssh("add", "austinschlegel@austins-mac-mini.tail1d8ec6.ts.net")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        entry = json.loads(self.zssh("list", "--json").stdout)["austins-mac-mini"]
+        self.assertEqual(entry["host"], "austins-mac-mini.tail1d8ec6.ts.net")
+        self.assertEqual(entry["user"], "austinschlegel")
+
+    def test_derived_name_handles_plain_hostnames_and_ports(self):
+        self.zssh("add", "db1.internal.example.com:2222")
+        entry = json.loads(self.zssh("list", "--json").stdout)["db1"]
+        self.assertEqual(entry["host"], "db1.internal.example.com")
+        self.assertEqual(entry["port"], 2222)
+        self.assertNotIn("user", entry)
+
+    def test_bare_ip_requires_an_explicit_name(self):
+        res = self.zssh("add", "10.0.0.9")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("cannot derive a name", res.stderr)
+        self.assertEqual(self.zssh("add", "box", "10.0.0.9").returncode, 0)
+
     def test_duplicate_needs_force(self):
         self.zssh("add", "box", "1.2.3.4")
         dup = self.zssh("add", "box", "5.6.7.8")

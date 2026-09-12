@@ -356,10 +356,30 @@ def schedule_expiry(name: str, session: dict) -> None:
 # commands
 # --------------------------------------------------------------------------
 
+IPV4_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
+
+
+def derive_name(host: str) -> str:
+    """Name a target after its first DNS label: db1.internal.example -> db1."""
+    if IPV4_RE.match(host) or ":" in host:
+        die("cannot derive a name from a bare IP address - "
+            "give one: zssh add <name> %s" % host)
+    label = host.split(".")[0].lower()
+    label = re.sub(r"[^a-z0-9._-]", "-", label).lstrip("-.")
+    if not NAME_RE.match(label):
+        die("cannot derive a name from %r - give one: zssh add <name> %s" % (host, host))
+    return label
+
+
 def cmd_add(args) -> int:
+    # `zssh add user@host` (no name) names the target after the host.
+    if args.destination is None:
+        args.name, args.destination = None, args.name
+    user, host, port = parse_destination(args.destination)
+    if args.name is None:
+        args.name = derive_name(host)
     if not NAME_RE.match(args.name):
         die("invalid name %r: use letters, digits, '.', '_' or '-'" % args.name)
-    user, host, port = parse_destination(args.destination)
     hosts = load_hosts()
     if args.name in hosts and not args.force:
         die("target %r already exists (use --force to overwrite)" % args.name)
@@ -422,6 +442,7 @@ def cmd_list(args) -> int:
         print(json.dumps(out, indent=2, sort_keys=True))
         return 0
     width = max(len(n) for n in hosts)
+    addr_width = min(max(len(describe(e)) for e in hosts.values()), 48)
     cur = current_name()
     for name, entry in sorted(hosts.items()):
         session, state = session_state(name, entry)
@@ -430,7 +451,7 @@ def cmd_list(args) -> int:
         else:
             status = "-"
         marker = "*" if name == cur and state == "live" else " "
-        line = "%s %-*s  %-28s  %s" % (marker, width, name, describe(entry), status)
+        line = "%s %-*s  %-*s  %s" % (marker, width, name, addr_width, describe(entry), status)
         if entry.get("description"):
             line += "  # " + entry["description"]
         print(line)
@@ -611,9 +632,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-V", "--version", action="version", version="zssh " + VERSION)
     sub = parser.add_subparsers(dest="cmd", metavar="<command>")
 
-    p = sub.add_parser("add", help="add or update a target")
-    p.add_argument("name")
-    p.add_argument("destination", help="[user@]host[:port]")
+    p = sub.add_parser("add", help="add or update a target",
+                       description="Add a target. With one argument, the target is "
+                                   "named after the host: `zssh add me@db1.example.com` "
+                                   "creates `db1`.")
+    p.add_argument("name", metavar="name|destination")
+    p.add_argument("destination", nargs="?", help="[user@]host[:port]")
     p.add_argument("-u", "--user")
     p.add_argument("-p", "--port", type=int)
     p.add_argument("-i", "--identity", help="path to a private key")

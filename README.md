@@ -26,14 +26,18 @@ and the BSDs. Windows needs WSL; see [Platform support](#platform-support).
 ## Targets
 
 ```sh
-zssh add prod deploy@10.0.0.7            # name -> address
+zssh add me@mini.tail1d8ec6.ts.net       # named after the host: "mini"
+zssh add prod deploy@10.0.0.7            # or name it yourself
 zssh add gpu ubuntu@192.168.1.50:2222 -i ~/.ssh/lab_ed25519
 zssh add jump root@203.0.113.9 -o ProxyJump=bastion -d "via bastion"
 zssh list
 zssh rm gpu
 ```
 
-`add` takes `[user@]host[:port]`; `-u/-p/-i` override the pieces, `-o` passes any
+`add` takes `[user@]host[:port]` — an IP, a DNS name, a Tailscale MagicDNS name,
+or anything else your ssh resolves. Give one argument and the target is named
+after the host's first label (`db1.internal.example.com` becomes `db1`); a bare
+IP has no such label, so name it yourself. `-u/-p/-i` override the pieces, `-o` passes any
 `ssh -o` option through (repeatable), `-d` adds a note. The address book is a
 plain JSON file — `zssh config-path` prints where.
 

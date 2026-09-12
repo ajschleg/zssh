@@ -498,16 +498,107 @@ def cmd_connect(args) -> int:
     if args.detach:
         print(name)
         return 0
-    return attach_shell(name, host)
+    return attach_shell(name, host, prompt=not args.no_prompt)
 
 
-def attach_shell(name: str, host: dict) -> int:
+def attach_shell(name: str, host: dict, prompt: bool = True) -> int:
     """Replace this process with an interactive shell - same tab, no subprocess."""
     argv = ["ssh", "-t"] + ssh_flags(name, host) + [destination(host)]
+    if prompt and os.environ.get("ZSSH_PROMPT") != "0":
+        command = prompt_command(name, host)
+        if command:
+            argv += ["--", command]
     sys.stderr.flush()
     sys.stdout.flush()
     os.execvp("ssh", argv)  # never returns
     return 0  # pragma: no cover
+
+
+# --------------------------------------------------------------------------
+# remote prompt
+# --------------------------------------------------------------------------
+
+# Both shims source the user's own startup files first, then append a hook that
+# re-asserts the prompt, so a prompt framework that sets PS1/PROMPT in its own
+# precmd doesn't immediately overwrite ours. The shim lives in a 0700 mktemp
+# directory and deletes itself once the shell has read it.
+
+ZSH_SHIM = r"""
+d=$(mktemp -d "${TMPDIR:-/tmp}/zssh.XXXXXX") || exit 1
+cat > "$d/.zshenv" <<'SHIM'
+[ -r "$HOME/.zshenv" ] && . "$HOME/.zshenv"
+SHIM
+cat > "$d/.zprofile" <<'SHIM'
+[ -r "$HOME/.zprofile" ] && . "$HOME/.zprofile"
+SHIM
+cat > "$d/.zshrc" <<'SHIM'
+[ -r "$HOME/.zshrc" ] && . "$HOME/.zshrc"
+__zssh_prompt() { PROMPT='%s:%%~%%# ' }
+typeset -ag precmd_functions
+precmd_functions+=(__zssh_prompt)
+__zssh_prompt
+SHIM
+cat > "$d/.zlogin" <<'SHIM'
+[ -r "$HOME/.zlogin" ] && . "$HOME/.zlogin"
+case "$ZDOTDIR" in */zssh.*) rm -rf -- "$ZDOTDIR" ;; esac
+ZDOTDIR="$HOME"
+SHIM
+printf '%%s
+' "$d"
+"""
+
+BASH_SHIM = r"""
+d=$(mktemp -d "${TMPDIR:-/tmp}/zssh.XXXXXX") || exit 1
+cat > "$d/rc" <<'SHIM'
+if [ -r "$HOME/.bash_profile" ]; then . "$HOME/.bash_profile"
+elif [ -r "$HOME/.bash_login" ]; then . "$HOME/.bash_login"
+elif [ -r "$HOME/.profile" ]; then . "$HOME/.profile"
+elif [ -r "$HOME/.bashrc" ]; then . "$HOME/.bashrc"
+fi
+__zssh_prompt() { PS1='%s:\w\$ '; }
+PROMPT_COMMAND="${PROMPT_COMMAND:+$PROMPT_COMMAND$'
+'}__zssh_prompt"
+__zssh_prompt
+__zssh_dir=$(dirname -- "${BASH_SOURCE[0]}")
+case "$__zssh_dir" in */zssh.*) rm -rf -- "$__zssh_dir" ;; esac
+unset __zssh_dir
+SHIM
+printf '%%s
+' "$d"
+"""
+
+
+def remote_run(name: str, host: dict, command: str, timeout: int = 10):
+    """Run a command over the open master and return stdout, or None."""
+    argv = ["ssh"] + ssh_flags(name, host) + [destination(host), "--", command]
+    try:
+        res = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return res.stdout.strip() if res.returncode == 0 else None
+
+
+def prompt_command(name: str, host: dict):
+    """Build the remote shell invocation that shows `zssh@<target>`.
+
+    Returns None whenever anything is unusual (unknown shell, read-only tmp,
+    a failed round trip) so `connect` still gives you a normal shell.
+    """
+    shell = remote_run(name, host, 'echo "$SHELL"')
+    if not shell:
+        return None
+    label = "zssh@" + check_name(name)  # name charset is already restricted
+    kind = os.path.basename(shell.strip())
+    if kind == "zsh":
+        setup, launch = ZSH_SHIM % label, "ZDOTDIR=%s exec zsh -l -i"
+    elif kind == "bash":
+        setup, launch = BASH_SHIM % label, "exec bash --rcfile %s/rc -i"
+    else:
+        return None  # fish, sh, csh, ... - leave the prompt alone
+    directory = remote_run(name, host, setup)
+    if not directory or not directory.startswith("/"):
+        return None
+    return launch % shlex.quote(directory)
 
 
 def cmd_terminal(args) -> int:
@@ -515,7 +606,7 @@ def cmd_terminal(args) -> int:
     host = get_host(name)
     require_live(name, host)
     set_current(name)
-    return attach_shell(name, host)
+    return attach_shell(name, host, prompt=not args.no_prompt)
 
 
 def cmd_exec(args) -> int:
@@ -731,11 +822,15 @@ def build_parser() -> argparse.ArgumentParser:
                    help="just open the session, do not start a shell")
     p.add_argument("--restart", action="store_true",
                    help="tear down an existing session first")
+    p.add_argument("--no-prompt", action="store_true",
+                   help="keep the remote shell's own prompt")
     p.set_defaults(func=cmd_connect)
 
     p = sub.add_parser("terminal", aliases=["term"],
                        help="open a shell on a connected target, in this tab")
     p.add_argument("name", nargs="?")
+    p.add_argument("--no-prompt", action="store_true",
+                   help="keep the remote shell's own prompt")
     p.set_defaults(func=cmd_terminal)
 
     p = sub.add_parser("exec", help="run a command on a connected target")

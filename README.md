@@ -53,6 +53,26 @@ The shell replaces the `zssh` process itself (`exec`), so you land on the remote
 host in the same terminal tab — no nested window, no new pane. Exiting the shell
 drops you back to your local prompt but **leaves the session open**.
 
+### The remote prompt
+
+Inside a `zssh` shell the prompt is the target's name, so you always know which
+box you're typing into:
+
+```
+zssh@prod:~%            # instead of deploy@f8638616-8d8f-4794-9257-8f36914a6f9a
+```
+
+It works by writing a throwaway startup file on the target (in a `0700` `mktemp`
+directory), sourcing your own rc files first and then appending a prompt hook —
+so your environment, aliases and PATH are exactly what they'd normally be. The
+shim deletes itself once the shell has read it, and nothing on the target is
+modified permanently.
+
+Supported for remote `zsh` and `bash`. Any other login shell (fish, sh, csh),
+or any hiccup writing the file, silently falls back to the shell's own prompt —
+`connect` never fails over cosmetics. Opt out per command with `--no-prompt`, or
+for good with `ZSSH_PROMPT=0`.
+
 ## Use the open session
 
 ```sh

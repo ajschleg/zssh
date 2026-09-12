@@ -331,6 +331,35 @@ class TestLiveSession(CliTestCase):
         self.assertEqual(self.zssh("exec", "cat /tmp/zssh-live-test").stdout.strip(), "persisted")
         self.zssh("exec", "rm -f /tmp/zssh-live-test")
 
+        # The interactive shell gets a `zssh@<target>` prompt via the shim.
+        import pty, re
+        def interactive(args, line):
+            chunks, inp = [], [line, b"exit\n"]
+            def rd(fd):
+                d = os.read(fd, 8192); chunks.append(d); return d
+            def wr(fd):
+                return inp.pop(0) if inp else b""
+            pty.spawn([sys.executable, str(BIN)] + args, rd, wr)
+            return re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b[=>]|\r", "",
+                          b"".join(chunks).decode(errors="replace"))
+
+        env_backup = os.environ.get("ZSSH_HOME")
+        os.environ["ZSSH_HOME"] = self.home
+        try:
+            out = interactive(["terminal", "local"], b"true\n")
+            self.assertIn("zssh@local", out)
+            plain = interactive(["terminal", "local", "--no-prompt"], b"true\n")
+            self.assertNotIn("zssh@local", plain)
+        finally:
+            if env_backup is None:
+                os.environ.pop("ZSSH_HOME", None)
+            else:
+                os.environ["ZSSH_HOME"] = env_backup
+
+        # No shim directories left behind on the remote.
+        left = self.zssh("exec", 'ls -d "${TMPDIR:-/tmp}"/zssh.* 2>/dev/null | wc -l')
+        self.assertEqual(left.stdout.strip(), "0")
+
         status = json.loads(self.zssh("status", "--json").stdout)
         self.assertEqual(status[0]["name"], "local")
 

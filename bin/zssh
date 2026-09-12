@@ -16,6 +16,7 @@ import json
 import os
 import re
 import shlex
+import stat
 import subprocess
 import sys
 import tempfile
@@ -53,9 +54,37 @@ def current_file() -> Path:
     return home() / "current"
 
 
+def secure_dir(path: Path) -> Path:
+    """Create/validate a private directory: ours, 0700, and not a symlink.
+
+    Matters most for the /tmp socket fallback on a shared machine: a control
+    socket in a directory someone else controls hands them a live, already
+    authenticated session.
+    """
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        try:
+            path.mkdir(parents=True, mode=0o700)
+        except FileExistsError:
+            return secure_dir(path)
+        except OSError as exc:
+            die("cannot create %s: %s" % (path, exc))
+        return path
+    if stat.S_ISLNK(st.st_mode):
+        die("refusing to use %s: it is a symlink" % path)
+    if not stat.S_ISDIR(st.st_mode):
+        die("refusing to use %s: not a directory" % path)
+    if st.st_uid != os.getuid():
+        die("refusing to use %s: owned by uid %d, not you" % (path, st.st_uid))
+    if st.st_mode & 0o077:
+        os.chmod(path, 0o700)
+    return path
+
+
 def ensure_dirs() -> None:
     for d in (home(), sessions_dir(), sockets_dir()):
-        d.mkdir(parents=True, exist_ok=True, mode=0o700)
+        secure_dir(d)
 
 
 # --------------------------------------------------------------------------
@@ -109,10 +138,13 @@ def load_hosts() -> dict:
 
 def save_hosts(hosts: dict) -> None:
     ensure_dirs()
+    for name in hosts:
+        check_name(name)
     write_json(hosts_file(), {"version": 1, "hosts": hosts})
 
 
 def get_host(name: str) -> dict:
+    check_name(name)
     hosts = load_hosts()
     if name not in hosts:
         known = ", ".join(sorted(hosts)) or "none yet"
@@ -156,16 +188,20 @@ def destination(host: dict) -> str:
 MAX_SOCKET_PATH = 80
 
 
+def check_name(name: str) -> str:
+    if not NAME_RE.match(name or ""):
+        die("invalid target name %r in %s: use letters, digits, '.', '_' or '-'"
+            % (name, hosts_file()))
+    return name
+
+
 def socket_path(name: str) -> Path:
+    name = check_name(name)
     path = sockets_dir() / (name + ".sock")
     if len(str(path)) <= MAX_SOCKET_PATH:
         return path
     # Long $HOME or ZSSH_HOME: fall back to a short, per-user path under /tmp.
-    short_dir = Path(tempfile.gettempdir()) / ("zssh-%d" % os.getuid())
-    try:
-        short_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    except OSError as exc:
-        die("cannot create socket directory %s: %s" % (short_dir, exc))
+    short_dir = secure_dir(Path(tempfile.gettempdir()) / ("zssh-%d" % os.getuid()))
     digest = hashlib.sha1(("%s\0%s" % (home(), name)).encode()).hexdigest()[:12]
     return short_dir / (digest + ".sock")
 
@@ -196,7 +232,7 @@ def ssh_flags(name: str, host: dict, master: bool = False, ttl: int = DEFAULT_TT
 # --------------------------------------------------------------------------
 
 def session_file(name: str) -> Path:
-    return sessions_dir() / (name + ".json")
+    return sessions_dir() / (check_name(name) + ".json")
 
 
 def read_session(name: str):

@@ -27,7 +27,7 @@ Requires Python 3.8+ and OpenSSH — both already on macOS and most Linux boxes.
 ```sh
 zssh add prod deploy@10.0.0.7            # name -> address
 zssh add gpu ubuntu@192.168.1.50:2222 -i ~/.ssh/lab_ed25519
-zssh add jump root@203.0.113.9 -o StrictHostKeyChecking=no -d "bastion"
+zssh add jump root@203.0.113.9 -o ProxyJump=bastion -d "via bastion"
 zssh list
 zssh rm gpu
 ```
@@ -89,9 +89,15 @@ zssh exec <command>             # runs on prod, reuses your session
 zssh status --json              # is it still open? how long left?
 ```
 
-It never handles a credential, it can't open a connection to anything you didn't
-connect to yourself, and the blast radius is bounded by the TTL — after an hour
-the session closes on its own even if nobody remembers to.
+The agent never handles a credential, and the blast radius is bounded by the
+TTL — after an hour the session closes itself even if nobody remembers to.
+
+Be clear-eyed about what this does *not* do: it is not a sandbox. `zssh exec`
+runs arbitrary commands as your user on that host, and if your key has no
+passphrase the agent can equally run `zssh connect` — or plain `ssh` — on its
+own. What you get is a smaller credential surface and a deadline, not a
+restriction on what the agent can do once it is on the box. See
+[Security](#security).
 
 ## Lifetime
 
@@ -100,6 +106,59 @@ A session lasts one hour by default (`--ttl` to change it), timed from
 small detached watchdog closes it exactly on time; `ControlPersist` is set to the
 same TTL as a backstop, and any `zssh` command also reaps sessions that have
 expired or whose master has died. `zssh close` ends one early.
+
+## Security
+
+`zssh` stores no secrets of its own — authentication is ordinary OpenSSH (your
+keys, your agent, your `~/.ssh/config`). `hosts.json` holds names, addresses,
+ssh options and *paths* to keys, never key material or passwords. Files are
+written `0600` and directories `0700`; if `~/.zssh` is found with looser modes,
+it is tightened on the next run.
+
+**The control socket is the sensitive object.** While a session is open,
+anything that can talk to `~/.zssh/s/<name>.sock` reaches that host as you, with
+no further authentication — that is exactly what makes `exec` fast and what
+makes the socket worth protecting. Concretely:
+
+- The socket directory is `0700` and verified on every run to be a real
+  directory that you own and not a symlink; `zssh` refuses to use it otherwise.
+  On a long `$HOME` the socket falls back to `/tmp/zssh-$UID/`, which lives in a
+  world-writable directory, so that check is what stops another local user from
+  pre-creating the path and inheriting your session.
+- **Any process running as your UID can use an open session** — other shells,
+  other tools, other agents. Unix permissions cannot separate you from yourself.
+  If that matters, keep sessions short (`--ttl`) and close them when done.
+- `root` on your machine can always reach it. Nothing here changes that.
+
+**What an agent can and cannot do.** An agent with shell access and an open
+session can run any command that account can run on the target — `zssh` adds no
+allowlist, no sandbox, no confirmation. It bounds *duration*, not *authority*.
+If the agent can also run `zssh connect` (your key is passphrase-less, or your
+ssh-agent is unlocked), it can open sessions by itself, so restrict the agent's
+own tool permissions if that is not what you want.
+
+**Auditing.** Commands sent by `zssh exec` are non-interactive and do **not**
+land in the remote shell history, so `~/.zsh_history` on the target will not
+show what an agent did. `sshd` logs the session, not the individual commands.
+If you need a per-command record, log it on the target (auditd, `pam_tty_audit`,
+a forced-command wrapper) rather than relying on shell history.
+
+**Host keys and forwarding.** Host key checking is whatever your ssh config
+says — `zssh` never weakens it, and you should not pass
+`-o StrictHostKeyChecking=no` on a host you care about, since multiplexing means
+one accepted impostor serves every later `exec`. Agent forwarding is off unless
+you add `-o ForwardAgent=yes`; forwarding your agent to a machine you don't
+fully trust lets that machine use your keys.
+
+**Sensible hardening for anything production-facing:**
+
+- Give the agent a dedicated, least-privileged account rather than your own.
+- Restrict what that key may do with `command=` / `ForceCommand` in
+  `authorized_keys` on the target.
+- Use a short `--ttl` (`zssh connect prod --ttl 900`) and `zssh close` when done.
+- Keep `zssh status` in view — it tells you what is open and for how long.
+
+Found a problem with any of this? Open an issue.
 
 ## Files
 

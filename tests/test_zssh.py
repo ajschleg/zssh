@@ -121,6 +121,57 @@ class TestUnits(unittest.TestCase):
         self.assertEqual(zssh.human_duration(-5), "0s")
 
 
+class TestHardening(CliTestCase):
+    def test_hand_edited_config_cannot_escape_the_config_dir(self):
+        # Names are used to build socket/session paths, so a traversal name in a
+        # hand-edited config must be refused rather than written through.
+        Path(self.home).mkdir(parents=True, exist_ok=True)
+        (Path(self.home) / "hosts.json").write_text(json.dumps(
+            {"version": 1, "hosts": {"../../evil": {"host": "1.2.3.4"}}}))
+        res = self.zssh("connect", "../../evil")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("invalid target name", res.stderr)
+
+    def test_loose_permissions_are_tightened(self):
+        os.chmod(self.home, 0o755)
+        self.zssh("add", "box", "1.2.3.4")
+        self.assertEqual(os.stat(self.home).st_mode & 0o777, 0o700)
+        for sub in ("sessions", "s"):
+            self.assertEqual(os.stat(os.path.join(self.home, sub)).st_mode & 0o777, 0o700)
+
+    def test_config_is_not_world_readable(self):
+        self.zssh("add", "box", "1.2.3.4")
+        self.assertEqual(os.stat(os.path.join(self.home, "hosts.json")).st_mode & 0o077, 0)
+
+
+class TestSecureDir(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="zssh-secdir-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def test_rejects_symlinked_directory(self):
+        real = Path(self.tmp) / "real"
+        real.mkdir()
+        link = Path(self.tmp) / "link"
+        link.symlink_to(real)
+        with self.assertRaises(SystemExit):
+            zssh.secure_dir(link)
+
+    def test_rejects_non_directory(self):
+        f = Path(self.tmp) / "afile"
+        f.write_text("x")
+        with self.assertRaises(SystemExit):
+            zssh.secure_dir(f)
+
+    def test_creates_private_and_tightens_existing(self):
+        fresh = Path(self.tmp) / "fresh"
+        zssh.secure_dir(fresh)
+        self.assertEqual(os.stat(fresh).st_mode & 0o777, 0o700)
+        os.chmod(fresh, 0o777)
+        zssh.secure_dir(fresh)
+        self.assertEqual(os.stat(fresh).st_mode & 0o777, 0o700)
+
+
 @unittest.skipUnless(localhost_ssh_works(), "ssh to localhost is not available")
 class TestLiveSession(CliTestCase):
     def test_connect_exec_close(self):

@@ -1,0 +1,94 @@
+#compdef zssh
+# zsh completion for zssh.
+
+_zssh_targets() {
+  local -a names
+  names=( ${(f)"$(zssh __targets --describe 2>/dev/null)"} )
+  (( ${#names} )) || return 1
+  _describe -t targets 'target' names
+}
+
+_zssh_live_targets() {
+  local -a names
+  names=( ${(f)"$(zssh __targets --live --describe 2>/dev/null)"} )
+  (( ${#names} )) || return 1
+  _describe -t targets 'open session' names
+}
+
+_zssh() {
+  local context state state_descr line
+  typeset -A opt_args
+
+  local -a commands
+  commands=(
+    'add:add or update a target'
+    'remove:remove a target (closes it first)'
+    'rm:remove a target (closes it first)'
+    'list:list targets and their session state'
+    'ls:list targets and their session state'
+    'connect:open a persistent session and a shell in this tab'
+    'terminal:open a shell on a connected target, in this tab'
+    'term:open a shell on a connected target, in this tab'
+    'exec:run a command on a connected target'
+    'close:close a session'
+    'status:show active sessions'
+    'config-path:print the config file path'
+  )
+
+  _arguments -C \
+    '(-h --help)'{-h,--help}'[show help]' \
+    '(-V --version)'{-V,--version}'[show version]' \
+    '1: :->command' \
+    '*:: :->args' && return 0
+
+  case $state in
+    command) _describe -t commands 'zssh command' commands && return 0 ;;
+    args)
+      case $words[1] in
+        add)
+          _arguments \
+            '1:name:' \
+            '2:destination ([user@]host[:port]):_ssh_hosts' \
+            '(-u --user)'{-u,--user}'[login user]:user:_users' \
+            '(-p --port)'{-p,--port}'[port]:port:' \
+            '(-i --identity)'{-i,--identity}'[private key]:key file:_files' \
+            '*'{-o,--option}'[extra ssh -o option]:option:' \
+            '(-d --description)'{-d,--description}'[note]:text:' \
+            '(-f --force)'{-f,--force}'[overwrite an existing target]'
+          ;;
+        remove|rm)
+          _arguments '1:target:_zssh_targets'
+          ;;
+        connect)
+          _arguments \
+            '1:target:_zssh_targets' \
+            '--ttl[session lifetime in seconds]:seconds:(300 900 1800 3600 7200)' \
+            '--detach[open the session without a shell]' \
+            '--restart[tear down an existing session first]'
+          ;;
+        terminal|term)
+          _arguments '1:target:_zssh_live_targets'
+          ;;
+        close)
+          _arguments \
+            '1:target:_zssh_live_targets' \
+            '(-a --all)'{-a,--all}'[close every session]'
+          ;;
+        status)
+          _arguments '1:target:_zssh_targets' '--json[machine-readable output]'
+          ;;
+        exec)
+          _arguments \
+            '(-t --target)'{-t,--target}'[target]:target:_zssh_live_targets' \
+            '--tty[allocate a remote tty]' \
+            '*:command:_command_names -e'
+          ;;
+        list|ls)
+          _arguments '--json[machine-readable output]'
+          ;;
+      esac
+      ;;
+  esac
+}
+
+_zssh "$@"

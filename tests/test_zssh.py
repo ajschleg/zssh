@@ -121,6 +121,58 @@ class TestUnits(unittest.TestCase):
         self.assertEqual(zssh.human_duration(-5), "0s")
 
 
+class TestCompletionSupport(CliTestCase):
+    """The completion scripts shell out to `zssh __targets`; keep it stable."""
+
+    def test_targets_lists_names_only(self):
+        self.zssh("add", "prod", "deploy@10.0.0.7", "-d", "prod web")
+        self.zssh("add", "gpu", "ubuntu@192.168.1.50:2222")
+        self.assertEqual(self.zssh("__targets").stdout.split(), ["gpu", "prod"])
+
+    def test_targets_describe_is_tab_separated(self):
+        self.zssh("add", "prod", "deploy@10.0.0.7", "-d", "prod web")
+        line = self.zssh("__targets", "--describe").stdout.strip()
+        self.assertEqual(line, "prod\tprod web")
+
+    def test_targets_describe_falls_back_to_address(self):
+        self.zssh("add", "gpu", "ubuntu@192.168.1.50:2222")
+        self.assertEqual(self.zssh("__targets", "--describe").stdout.strip(),
+                         "gpu\tubuntu@192.168.1.50:2222")
+
+    def test_live_filter_is_empty_without_sessions(self):
+        self.zssh("add", "prod", "deploy@10.0.0.7")
+        self.assertEqual(self.zssh("__targets", "--live").stdout.strip(), "")
+
+    def test_targets_skips_malformed_names(self):
+        Path(self.home).mkdir(parents=True, exist_ok=True)
+        (Path(self.home) / "hosts.json").write_text(json.dumps(
+            {"version": 1, "hosts": {"ok": {"host": "1.2.3.4"},
+                                     "../bad": {"host": "5.6.7.8"}}}))
+        self.assertEqual(self.zssh("__targets").stdout.split(), ["ok"])
+
+
+class TestCompletionScripts(unittest.TestCase):
+    def test_zsh_completion_parses(self):
+        if shutil.which("zsh") is None:
+            self.skipTest("zsh not available")
+        res = subprocess.run(["zsh", "-n", str(ROOT / "completions" / "_zssh")],
+                             capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, res.stderr)
+
+    def test_bash_completion_parses(self):
+        res = subprocess.run(["bash", "-n", str(ROOT / "completions" / "zssh.bash")],
+                             capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, res.stderr)
+
+    def test_every_command_appears_in_both_completions(self):
+        zsh_src = (ROOT / "completions" / "_zssh").read_text()
+        bash_src = (ROOT / "completions" / "zssh.bash").read_text()
+        for cmd in ("add", "remove", "rm", "list", "ls", "connect",
+                    "terminal", "term", "exec", "close", "status", "config-path"):
+            self.assertIn(cmd, zsh_src, "%s missing from zsh completion" % cmd)
+            self.assertIn(cmd, bash_src, "%s missing from bash completion" % cmd)
+
+
 class TestHardening(CliTestCase):
     def test_hand_edited_config_cannot_escape_the_config_dir(self):
         # Names are used to build socket/session paths, so a traversal name in a

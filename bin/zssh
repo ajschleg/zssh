@@ -575,6 +575,23 @@ def cmd_path(args) -> int:
     return 0
 
 
+def cmd_targets(args) -> int:
+    """Target names, one per line - used by the shell completions."""
+    hosts = load_hosts()
+    for name in sorted(hosts):
+        if not NAME_RE.match(name):
+            continue
+        if args.live and session_state(name, hosts[name])[1] != "live":
+            continue
+        if args.describe:
+            entry = hosts[name]
+            note = entry.get("description") or describe(entry)
+            print("%s\t%s" % (name, note))
+        else:
+            print(name)
+    return 0
+
+
 # --------------------------------------------------------------------------
 # cli
 # --------------------------------------------------------------------------
@@ -640,6 +657,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("config-path", help="print the config file path")
     p.set_defaults(func=cmd_path)
+
+    p = sub.add_parser("__targets")  # used by shell completions
+    p.add_argument("--live", action="store_true", help="only connected targets")
+    p.add_argument("--describe", action="store_true", help="append a tab + note")
+    p.set_defaults(func=cmd_targets)
 
     p = sub.add_parser("__expire")  # internal watchdog, intentionally undocumented
     p.add_argument("name")

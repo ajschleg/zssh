@@ -107,6 +107,35 @@ small detached watchdog closes it exactly on time; `ControlPersist` is set to th
 same TTL as a backstop, and any `zssh` command also reaps sessions that have
 expired or whose master has died. `zssh close` ends one early.
 
+## Completions
+
+`./install.sh` links a zsh completion into `~/.zsh/completions`. If that
+directory isn't already on your `fpath`, add this to `~/.zshrc` above any
+existing `compinit`:
+
+```sh
+fpath=(~/.zsh/completions $fpath)
+autoload -Uz compinit && compinit
+```
+
+For bash, source the script instead:
+
+```sh
+source /path/to/zssh/completions/zssh.bash
+```
+
+Then TAB completes subcommands, flags, and **your target names** — pulled live
+from your address book, with their notes shown alongside:
+
+```
+$ zssh connect <TAB>
+gpu   -- lab gpu
+prod  -- prod web
+```
+
+`terminal`, `close` and `exec -t` complete only targets that actually have an
+open session, so TAB won't offer you something you'd have to connect first.
+
 ## Security
 
 `zssh` stores no secrets of its own — authentication is ordinary OpenSSH (your

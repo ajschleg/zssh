@@ -201,7 +201,9 @@ def socket_path(name: str) -> Path:
     if len(str(path)) <= MAX_SOCKET_PATH:
         return path
     # Long $HOME or ZSSH_HOME: fall back to a short, per-user path under /tmp.
-    short_dir = secure_dir(Path(tempfile.gettempdir()) / ("zssh-%d" % os.getuid()))
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    base = Path(runtime) if runtime and os.path.isdir(runtime) else Path(tempfile.gettempdir())
+    short_dir = secure_dir(base / ("zssh-%d" % os.getuid()))
     digest = hashlib.sha1(("%s\0%s" % (home(), name)).encode()).hexdigest()[:12]
     return short_dir / (digest + ".sock")
 
@@ -361,6 +363,11 @@ def cmd_add(args) -> int:
     hosts = load_hosts()
     if args.name in hosts and not args.force:
         die("target %r already exists (use --force to overwrite)" % args.name)
+    clash = next((n for n in hosts if n.lower() == args.name.lower() and n != args.name), None)
+    if clash:
+        die("target %r collides with %r: names that differ only in case share one "
+            "session file on a case-insensitive filesystem (macOS, Windows)"
+            % (args.name, clash))
     entry = {"host": host}
     if args.user or user:
         entry["user"] = args.user or user

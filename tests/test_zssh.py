@@ -74,6 +74,14 @@ class TestHostBook(CliTestCase):
         self.assertEqual(self.zssh("add", "box", "5.6.7.8", "--force").returncode, 0)
         self.assertEqual(json.loads(self.zssh("list", "--json").stdout)["box"]["host"], "5.6.7.8")
 
+    def test_rejects_case_only_collision(self):
+        # Two such names are distinct JSON keys but one socket file on APFS/NTFS.
+        self.zssh("add", "prod", "10.0.0.1")
+        res = self.zssh("add", "PROD", "10.0.0.2")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("collides", res.stderr)
+        self.assertEqual(self.zssh("__targets").stdout.split(), ["prod"])
+
     def test_rejects_bad_name_and_port(self):
         self.assertNotEqual(self.zssh("add", "bad name", "1.2.3.4").returncode, 0)
         self.assertNotEqual(self.zssh("add", "ok", "1.2.3.4:http").returncode, 0)

@@ -20,7 +20,8 @@ git clone <this repo> && cd zssh
 ./install.sh /usr/local/bin   # ...or wherever you like
 ```
 
-Requires Python 3.8+ and OpenSSH — both already on macOS and most Linux boxes.
+Requires Python 3.8+ and OpenSSH 5.6+ — both already present on macOS, Linux
+and the BSDs. Windows needs WSL; see [Platform support](#platform-support).
 
 ## Targets
 
@@ -135,6 +136,58 @@ prod  -- prod web
 
 `terminal`, `close` and `exec -t` complete only targets that actually have an
 open session, so TAB won't offer you something you'd have to connect first.
+
+## Platform support
+
+| Platform | Status | Notes |
+| --- | --- | --- |
+| macOS | Tested | Developed and end-to-end tested here (14/15, Apple's system Python 3.9, OpenSSH 10.3) |
+| Linux | Expected to work | Same POSIX calls and same OpenSSH features; sockets go in `$XDG_RUNTIME_DIR` when set |
+| BSD (FreeBSD/OpenBSD/NetBSD) | Expected to work | OpenSSH is native; nothing platform-specific beyond POSIX |
+| WSL | Expected to work | It is Linux — use the WSL `ssh`, not `ssh.exe` |
+| Windows (native) | **Not supported** | See below |
+
+Honest labelling: "Tested" means I ran it against a real sshd; "Expected to
+work" means the code paths are POSIX-standard and nothing in it is
+macOS-specific, but I have not run it on that OS.
+
+**Requirements:** Python **3.8+** (`shlex.join`) and OpenSSH **5.6+** (2010, for
+`ControlPersist`). No third-party packages.
+
+### Why Windows doesn't work
+
+Not a rough edge — three independent blockers:
+
+1. **Win32 OpenSSH does not implement connection multiplexing.** `ControlMaster`
+   / `ControlPath` / `ControlPersist` are unsupported there, and they are the
+   entire basis for a session that outlives the command that opened it.
+2. **`os.execvp` doesn't replace a process on Windows.** The "shell opens in the
+   same tab" behaviour comes from `zssh` *becoming* the ssh process; on Windows
+   that call spawns a child and the parent exits.
+3. **POSIX-only calls**: `os.getuid()` (used for the socket directory and the
+   ownership check) doesn't exist on Windows, and `start_new_session` for the
+   TTL watchdog is POSIX-only.
+
+Use WSL, where all three are non-issues. Git Bash and MSYS2 generally shell out
+to Win32 `ssh.exe`, so blocker 1 still applies.
+
+### Cross-platform details worth knowing
+
+- **Unix socket path limits** differ (~104 bytes on macOS/BSD, ~108 on Linux).
+  `zssh` keeps sockets in `~/.zssh/s/` and falls back to a hashed name under
+  `$XDG_RUNTIME_DIR` or `/tmp/zssh-$UID/` when the path would get close, so a
+  long `$HOME` or a deep `ZSSH_HOME` won't break `connect`.
+- **Case-insensitive filesystems** (macOS APFS/HFS+ by default, Windows NTFS):
+  `prod` and `PROD` are two entries in the config but would share one socket
+  and session file. `add` refuses such a pair rather than letting them collide;
+  on case-sensitive Linux they would have been genuinely distinct.
+- **Dropbear** (OpenWrt, some embedded/BusyBox systems) has no multiplexing
+  client-side — `zssh` needs OpenSSH on the machine you run it *from*. The
+  remote end can be anything, including Dropbear.
+- **The remote OS is a separate question.** `exec` hands a command string to the
+  target's login shell, which assumes a POSIX shell. A target whose default
+  shell is `cmd.exe` or PowerShell will not honour POSIX quoting; point the
+  account at a POSIX shell if you need `exec` there.
 
 ## Security
 

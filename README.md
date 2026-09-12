@@ -129,8 +129,12 @@ For bash, source the script instead:
 source /path/to/zssh/completions/zssh.bash
 ```
 
-Then TAB completes subcommands, flags, and **your target names** — pulled live
-from your address book, with their notes shown alongside:
+`install.sh` adds the `fpath` line to `~/.zshrc` for you (above your existing
+`compinit`, with a `.zssh-backup` alongside). Set `ZSSH_NO_RC_EDIT=1` if you'd
+rather wire it up yourself.
+
+TAB then completes subcommands, flags, and **target names** — pulled live from
+your address book, with their notes shown alongside:
 
 ```
 $ zssh connect <TAB>
@@ -140,6 +144,18 @@ prod  -- prod web
 
 `terminal`, `close` and `exec -t` complete only targets that actually have an
 open session, so TAB won't offer you something you'd have to connect first.
+
+`add` completes the *host* you're adding, gathered from `~/.ssh/config`,
+unhashed `~/.ssh/known_hosts` entries, and your Tailscale peers when the
+`tailscale` CLI is present (both the short name and the full MagicDNS name):
+
+```
+$ zssh add <TAB>
+austins-mac-mini  austins-mac-mini.tail1d8ec6.ts.net  db1.internal  github.com
+```
+
+Set `ZSSH_TAILSCALE` to point at a non-standard `tailscale` binary, or to an
+empty string to skip the tailnet lookup.
 
 ## Platform support
 

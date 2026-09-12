@@ -35,7 +35,11 @@ _zssh_complete() {
       COMPREPLY=( $(compgen -W "-t --target --tty" -- "$cur") )
       ;;
     add)
-      COMPREPLY=( $(compgen -W "-u -p -i -o -d --force" -- "$cur") )
+      if [ "$COMP_CWORD" -le 3 ] && [[ "$cur" != -* ]]; then
+        COMPREPLY=( $(compgen -W "$(zssh __destinations 2>/dev/null)" -- "$cur") )
+      else
+        COMPREPLY=( $(compgen -W "-u -p -i -o -d --force" -- "$cur") )
+      fi
       ;;
     list|ls)
       COMPREPLY=( $(compgen -W "--json" -- "$cur") )

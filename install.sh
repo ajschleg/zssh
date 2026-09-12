@@ -17,13 +17,36 @@ echo "linked $ZSH_COMP_DIR/_zssh"
 
 case "${SHELL:-}" in
   */zsh)
-    if ! grep -qs "$ZSH_COMP_DIR" "$HOME/.zshrc" 2>/dev/null; then
-      cat <<MSG
-
-To enable completions, add this to ~/.zshrc (above any existing compinit):
-  fpath=($ZSH_COMP_DIR \$fpath)
-  autoload -Uz compinit && compinit
-MSG
+    ZSHRC="$HOME/.zshrc"
+    if grep -qs "zssh completions" "$ZSHRC" 2>/dev/null; then
+      echo "completions already enabled in $ZSHRC"
+    elif [ "${ZSSH_NO_RC_EDIT:-}" = "1" ]; then
+      echo
+      echo "To enable completions, add this to $ZSHRC above any compinit line:"
+      echo "  fpath=($ZSH_COMP_DIR \$fpath)"
+    else
+      cp "$ZSHRC" "$ZSHRC.zssh-backup" 2>/dev/null || true
+      # fpath must be set before compinit runs, so insert above the first
+      # compinit line if there is one; otherwise append with our own compinit.
+      if grep -qs "compinit" "$ZSHRC" 2>/dev/null; then
+        awk -v dir="$ZSH_COMP_DIR" '
+          !done && /compinit/ {
+            print "# zssh completions"
+            print "fpath=(" dir " $fpath)"
+            done = 1
+          }
+          { print }
+        ' "$ZSHRC" > "$ZSHRC.zssh-tmp" && mv "$ZSHRC.zssh-tmp" "$ZSHRC"
+      else
+        {
+          echo ""
+          echo "# zssh completions"
+          echo "fpath=($ZSH_COMP_DIR \$fpath)"
+          echo "autoload -Uz compinit && compinit"
+        } >> "$ZSHRC"
+      fi
+      echo "enabled completions in $ZSHRC (backup: $ZSHRC.zssh-backup)"
+      echo "run 'exec zsh' to pick them up in this shell"
     fi
     ;;
   */bash)

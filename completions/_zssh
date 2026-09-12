@@ -15,6 +15,13 @@ _zssh_live_targets() {
   _describe -t targets 'open session' names
 }
 
+_zssh_destinations() {
+  local -a dests
+  dests=( ${(f)"$(zssh __destinations 2>/dev/null)"} )
+  (( ${#dests} )) && _describe -t destinations 'known host' dests
+  _ssh_hosts 2>/dev/null
+}
+
 _zssh() {
   local context state state_descr line
   typeset -A opt_args
@@ -47,8 +54,8 @@ _zssh() {
       case $words[1] in
         add)
           _arguments \
-            '1:name:' \
-            '2:destination ([user@]host[:port]):_ssh_hosts' \
+            '1:name or [user@]host[:port]:_zssh_destinations' \
+            '2:destination ([user@]host[:port]):_zssh_destinations' \
             '(-u --user)'{-u,--user}'[login user]:user:_users' \
             '(-p --port)'{-p,--port}'[port]:port:' \
             '(-i --identity)'{-i,--identity}'[private key]:key file:_files' \

@@ -16,6 +16,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import stat
 import subprocess
 import sys
@@ -598,6 +599,73 @@ def cmd_expire(args) -> int:
     return 0
 
 
+def ssh_config_hosts():
+    try:
+        text = (Path.home() / ".ssh" / "config").read_text(errors="replace")
+    except OSError:
+        return
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.lower().startswith("host "):
+            continue
+        for pattern in line.split(None, 1)[1].split():
+            if not any(c in pattern for c in "*?!"):
+                yield pattern
+
+
+def known_hosts_names():
+    try:
+        text = (Path.home() / ".ssh" / "known_hosts").read_text(errors="replace")
+    except OSError:
+        return
+    for line in text.splitlines():
+        if not line.strip() or line.startswith(("#", "@", "|")):
+            continue  # '|' is a hashed entry - nothing readable to offer
+        for entry in line.split()[0].split(","):
+            if entry.startswith("["):          # [host]:port
+                entry = entry[1:].split("]")[0]
+            if entry and not entry.startswith("|"):
+                yield entry
+
+
+def tailscale_names():
+    # ZSSH_TAILSCALE overrides the binary; set it empty to skip tailnet lookup.
+    exe = os.environ.get("ZSSH_TAILSCALE")
+    if exe == "":
+        return
+    exe = exe or shutil.which("tailscale") or \
+        "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+    if not os.path.exists(exe):
+        return
+    try:
+        out = subprocess.run([exe, "status", "--json"], capture_output=True,
+                             text=True, timeout=3)
+        data = json.loads(out.stdout or "{}")
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return
+    peers = list((data.get("Peer") or {}).values())
+    for peer in peers:
+        dns = (peer.get("DNSName") or "").rstrip(".")
+        if dns:
+            yield dns
+            yield dns.split(".")[0]
+
+
+def cmd_destinations(args) -> int:
+    """Plausible ssh destinations - used by the completions for `add`."""
+    seen = []
+    for source in (ssh_config_hosts(), known_hosts_names(), tailscale_names()):
+        try:
+            for name in source:
+                if name not in seen:
+                    seen.append(name)
+        except Exception:
+            continue  # never let completion die on a malformed file
+    for name in sorted(seen):
+        print(name)
+    return 0
+
+
 def cmd_path(args) -> int:
     print(hosts_file())
     return 0
@@ -693,6 +761,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--live", action="store_true", help="only connected targets")
     p.add_argument("--describe", action="store_true", help="append a tab + note")
     p.set_defaults(func=cmd_targets)
+
+    p = sub.add_parser("__destinations")  # used by shell completions
+    p.set_defaults(func=cmd_destinations)
 
     p = sub.add_parser("__expire")  # internal watchdog, intentionally undocumented
     p.add_argument("name")

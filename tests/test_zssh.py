@@ -179,6 +179,58 @@ class TestCompletionSupport(CliTestCase):
         self.assertEqual(self.zssh("__targets").stdout.split(), ["ok"])
 
 
+class TestDestinationDiscovery(CliTestCase):
+    """`zssh __destinations` feeds completion for `add`; it must never crash."""
+
+    def fake_home(self, config=None, known=None):
+        fake = tempfile.mkdtemp(prefix="zssh-home-")
+        self.addCleanup(shutil.rmtree, fake, True)
+        ssh = Path(fake) / ".ssh"
+        ssh.mkdir()
+        if config is not None:
+            (ssh / "config").write_text(config)
+        if known is not None:
+            (ssh / "known_hosts").write_text(known)
+        env = dict(self.env, HOME=fake, ZSSH_TAILSCALE="")  # skip tailnet lookup
+        return env
+
+    def run_dests(self, env):
+        res = subprocess.run([sys.executable, str(BIN), "__destinations"],
+                             env=env, capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        return res.stdout.split()
+
+    def test_reads_ssh_config_and_skips_wildcards(self):
+        env = self.fake_home(config="Host web1 web2\n  User deploy\nHost *.internal\nHost *\n")
+        out = self.run_dests(env)
+        self.assertIn("web1", out)
+        self.assertIn("web2", out)
+        self.assertNotIn("*", out)
+        self.assertNotIn("*.internal", out)
+
+    def test_reads_known_hosts_and_skips_hashed_entries(self):
+        env = self.fake_home(known=(
+            "example.com ssh-ed25519 AAAA\n"
+            "[10.0.0.5]:2222 ssh-rsa BBBB\n"
+            "alpha.local,10.0.0.6 ssh-ed25519 CCCC\n"
+            "|1|hashedsalt=|hashedhost= ssh-ed25519 DDDD\n"))
+        out = self.run_dests(env)
+        self.assertIn("example.com", out)
+        self.assertIn("10.0.0.5", out)   # port stripped from [host]:port
+        self.assertIn("alpha.local", out)
+        self.assertIn("10.0.0.6", out)
+        self.assertFalse([x for x in out if x.startswith("|")])
+
+    def test_survives_missing_files(self):
+        self.assertEqual(self.run_dests(self.fake_home()), [])
+
+    def test_output_is_sorted_and_deduplicated(self):
+        env = self.fake_home(config="Host dup\nHost alpha\n", known="dup ssh-ed25519 AAAA\n")
+        out = self.run_dests(env)
+        self.assertEqual(out, sorted(out))
+        self.assertEqual(len(out), len(set(out)))
+
+
 class TestCompletionScripts(unittest.TestCase):
     def test_zsh_completion_parses(self):
         if shutil.which("zsh") is None:
@@ -191,6 +243,13 @@ class TestCompletionScripts(unittest.TestCase):
         res = subprocess.run(["bash", "-n", str(ROOT / "completions" / "zssh.bash")],
                              capture_output=True, text=True)
         self.assertEqual(res.returncode, 0, res.stderr)
+
+    def test_completions_use_the_hidden_helpers(self):
+        zsh_src = (ROOT / "completions" / "_zssh").read_text()
+        bash_src = (ROOT / "completions" / "zssh.bash").read_text()
+        for src in (zsh_src, bash_src):
+            self.assertIn("__targets", src)
+            self.assertIn("__destinations", src)
 
     def test_every_command_appears_in_both_completions(self):
         zsh_src = (ROOT / "completions" / "_zssh").read_text()

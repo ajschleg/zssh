@@ -1,0 +1,629 @@
+#!/usr/bin/env python3
+"""zssh - named, persistent SSH sessions for humans and AI agents.
+
+Targets are named entries in a config file. `zssh connect <name>` opens a
+multiplexed SSH master connection (OpenSSH ControlMaster) and then drops you
+into an interactive shell in the *same* terminal tab. The master outlives that
+shell, so `zssh exec ...` reuses the very same TCP/auth session with no
+re-authentication, until `zssh close` or the TTL (default 1 hour) expires it.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+from pathlib import Path
+
+VERSION = "0.1.0"
+DEFAULT_TTL = 3600  # seconds; one hour
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+# --------------------------------------------------------------------------
+# paths
+# --------------------------------------------------------------------------
+
+def home() -> Path:
+    return Path(os.environ.get("ZSSH_HOME") or (Path.home() / ".zssh")).expanduser()
+
+
+def hosts_file() -> Path:
+    return home() / "hosts.json"
+
+
+def sessions_dir() -> Path:
+    return home() / "sessions"
+
+
+def sockets_dir() -> Path:
+    # Deliberately short: unix socket paths are capped near 104 bytes.
+    return home() / "s"
+
+
+def current_file() -> Path:
+    return home() / "current"
+
+
+def ensure_dirs() -> None:
+    for d in (home(), sessions_dir(), sockets_dir()):
+        d.mkdir(parents=True, exist_ok=True, mode=0o700)
+
+
+# --------------------------------------------------------------------------
+# small helpers
+# --------------------------------------------------------------------------
+
+def die(msg: str, code: int = 1):
+    print("zssh: " + msg, file=sys.stderr)
+    raise SystemExit(code)
+
+
+def info(msg: str) -> None:
+    print("zssh: " + msg, file=sys.stderr)
+
+
+def human_duration(seconds: float) -> str:
+    seconds = int(max(0, seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return "%dh%02dm" % (h, m)
+    if m:
+        return "%dm%02ds" % (m, s)
+    return "%ds" % s
+
+
+def write_json(path: Path, data) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+    os.chmod(tmp, 0o600)
+    tmp.replace(path)
+
+
+def read_json(path: Path, default):
+    try:
+        return json.loads(path.read_text())
+    except FileNotFoundError:
+        return default
+    except (ValueError, OSError) as exc:
+        die("could not read %s: %s" % (path, exc))
+
+
+# --------------------------------------------------------------------------
+# host book
+# --------------------------------------------------------------------------
+
+def load_hosts() -> dict:
+    data = read_json(hosts_file(), {})
+    return data.get("hosts", {}) if isinstance(data, dict) else {}
+
+
+def save_hosts(hosts: dict) -> None:
+    ensure_dirs()
+    write_json(hosts_file(), {"version": 1, "hosts": hosts})
+
+
+def get_host(name: str) -> dict:
+    hosts = load_hosts()
+    if name not in hosts:
+        known = ", ".join(sorted(hosts)) or "none yet"
+        die("unknown target %r (known: %s)" % (name, known))
+    return hosts[name]
+
+
+def parse_destination(spec: str):
+    """Split [user@]host[:port] into (user, host, port)."""
+    user = None
+    port = None
+    if "@" in spec:
+        user, spec = spec.rsplit("@", 1)
+    if spec.startswith("["):  # bracketed IPv6, optionally [::1]:22
+        close = spec.find("]")
+        if close == -1:
+            die("malformed address %r" % spec)
+        host = spec[1:close]
+        rest = spec[close + 1:]
+        if rest.startswith(":"):
+            port = rest[1:]
+    elif spec.count(":") == 1:
+        host, port = spec.split(":")
+    else:
+        host = spec
+    if not host:
+        die("missing host in destination")
+    if port is not None:
+        if not port.isdigit():
+            die("invalid port %r" % port)
+        port = int(port)
+    return user, host, port
+
+
+def destination(host: dict) -> str:
+    return ("%s@%s" % (host["user"], host["host"])) if host.get("user") else host["host"]
+
+
+# ssh appends a ~17-char suffix while setting the master up, and unix socket
+# paths cap out near 104 bytes, so keep well clear of it.
+MAX_SOCKET_PATH = 80
+
+
+def socket_path(name: str) -> Path:
+    path = sockets_dir() / (name + ".sock")
+    if len(str(path)) <= MAX_SOCKET_PATH:
+        return path
+    # Long $HOME or ZSSH_HOME: fall back to a short, per-user path under /tmp.
+    short_dir = Path(tempfile.gettempdir()) / ("zssh-%d" % os.getuid())
+    try:
+        short_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    except OSError as exc:
+        die("cannot create socket directory %s: %s" % (short_dir, exc))
+    digest = hashlib.sha1(("%s\0%s" % (home(), name)).encode()).hexdigest()[:12]
+    return short_dir / (digest + ".sock")
+
+
+def ssh_flags(name: str, host: dict, master: bool = False, ttl: int = DEFAULT_TTL):
+    """Common ssh flags for a target, including the multiplexing socket."""
+    flags = ["-o", "ControlPath=%s" % socket_path(name)]
+    if master:
+        flags += [
+            "-o", "ControlMaster=yes",
+            "-o", "ControlPersist=%ds" % ttl,
+            "-o", "ServerAliveInterval=30",
+            "-o", "ServerAliveCountMax=3",
+        ]
+    else:
+        flags += ["-o", "ControlMaster=no"]
+    if host.get("port"):
+        flags += ["-p", str(host["port"])]
+    if host.get("identity"):
+        flags += ["-i", os.path.expanduser(host["identity"])]
+    for opt in host.get("options", []):
+        flags += ["-o", opt]
+    return flags
+
+
+# --------------------------------------------------------------------------
+# sessions
+# --------------------------------------------------------------------------
+
+def session_file(name: str) -> Path:
+    return sessions_dir() / (name + ".json")
+
+
+def read_session(name: str):
+    return read_json(session_file(name), None)
+
+
+def write_session(name: str, session: dict) -> None:
+    ensure_dirs()
+    write_json(session_file(name), session)
+
+
+def clear_session(name: str) -> None:
+    try:
+        session_file(name).unlink()
+    except FileNotFoundError:
+        pass
+    if current_name() == name:
+        try:
+            current_file().unlink()
+        except FileNotFoundError:
+            pass
+
+
+def current_name():
+    try:
+        return current_file().read_text().strip() or None
+    except FileNotFoundError:
+        return None
+
+
+def set_current(name: str) -> None:
+    ensure_dirs()
+    current_file().write_text(name + "\n")
+
+
+def master_alive(name: str, host: dict) -> bool:
+    if not socket_path(name).exists():
+        return False
+    check = ["ssh", "-O", "check"] + ssh_flags(name, host) + [destination(host)]
+    return subprocess.run(check, stdout=subprocess.DEVNULL,
+                          stderr=subprocess.DEVNULL).returncode == 0
+
+
+def stop_master(name: str, host: dict) -> None:
+    subprocess.run(["ssh", "-O", "exit"] + ssh_flags(name, host) + [destination(host)],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        socket_path(name).unlink()
+    except FileNotFoundError:
+        pass
+
+
+def session_state(name: str, host: dict):
+    """Return (session, state) where state is live | expired | dead | none."""
+    session = read_session(name)
+    if session is None:
+        return None, ("orphan" if master_alive(name, host) else "none")
+    if time.time() >= session.get("expires_at", 0):
+        return session, "expired"
+    if not master_alive(name, host):
+        return session, "dead"
+    return session, "live"
+
+
+def reap(name: str, host: dict) -> None:
+    """Tear down a session that expired or whose master vanished."""
+    session, state = session_state(name, host)
+    if state in ("expired", "dead", "orphan"):
+        stop_master(name, host)
+        clear_session(name)
+
+
+def reap_all() -> None:
+    hosts = load_hosts()
+    for name, host in hosts.items():
+        reap(name, host)
+
+
+def require_live(name: str, host: dict) -> dict:
+    session, state = session_state(name, host)
+    if state == "live":
+        return session
+    reap(name, host)
+    if state == "expired":
+        die("session %r expired after %s - run: zssh connect %s"
+            % (name, human_duration(session.get("ttl", DEFAULT_TTL)), name))
+    if state == "dead":
+        die("session %r is no longer alive - run: zssh connect %s" % (name, name))
+    die("no active session for %r - run: zssh connect %s" % (name, name))
+
+
+def resolve_target(name):
+    """Pick the target for exec/terminal/close when none was given."""
+    if name:
+        return name
+    hosts = load_hosts()
+    live = [n for n, h in hosts.items() if session_state(n, h)[1] == "live"]
+    if len(live) == 1:
+        return live[0]
+    cur = current_name()
+    if cur and cur in live:
+        return cur
+    if not live:
+        die("no active sessions - run: zssh connect <target>")
+    die("several sessions active (%s) - name one, e.g. zssh exec -t %s ..."
+        % (", ".join(sorted(live)), sorted(live)[0]))
+
+
+def schedule_expiry(name: str, session: dict) -> None:
+    """Detach a watchdog that closes the session when its TTL runs out."""
+    subprocess.Popen(
+        [sys.executable, os.path.abspath(__file__), "__expire", name, session["id"]],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+# --------------------------------------------------------------------------
+# commands
+# --------------------------------------------------------------------------
+
+def cmd_add(args) -> int:
+    if not NAME_RE.match(args.name):
+        die("invalid name %r: use letters, digits, '.', '_' or '-'" % args.name)
+    user, host, port = parse_destination(args.destination)
+    hosts = load_hosts()
+    if args.name in hosts and not args.force:
+        die("target %r already exists (use --force to overwrite)" % args.name)
+    entry = {"host": host}
+    if args.user or user:
+        entry["user"] = args.user or user
+    if args.port or port:
+        entry["port"] = args.port or port
+    if args.identity:
+        entry["identity"] = args.identity
+    if args.option:
+        entry["options"] = list(args.option)
+    if args.description:
+        entry["description"] = args.description
+    hosts[args.name] = entry
+    save_hosts(hosts)
+    print("added %s -> %s" % (args.name, describe(entry)))
+    return 0
+
+
+def cmd_remove(args) -> int:
+    hosts = load_hosts()
+    if args.name not in hosts:
+        die("unknown target %r" % args.name)
+    host = hosts[args.name]
+    if session_state(args.name, host)[1] in ("live", "expired", "dead", "orphan"):
+        stop_master(args.name, host)
+        clear_session(args.name)
+    del hosts[args.name]
+    save_hosts(hosts)
+    print("removed %s" % args.name)
+    return 0
+
+
+def describe(entry: dict) -> str:
+    text = destination(entry)
+    if entry.get("port"):
+        text += ":%d" % entry["port"]
+    return text
+
+
+def cmd_list(args) -> int:
+    hosts = load_hosts()
+    if not hosts and not args.json:
+        print("no targets yet - add one with: zssh add <name> [user@]<host>[:port]")
+        return 0
+    reap_all()
+    if args.json:
+        out = {}
+        for name, entry in sorted(hosts.items()):
+            session, state = session_state(name, entry)
+            out[name] = dict(entry, status=state if state == "live" else "offline")
+            if session and state == "live":
+                out[name]["expires_at"] = session["expires_at"]
+        print(json.dumps(out, indent=2, sort_keys=True))
+        return 0
+    width = max(len(n) for n in hosts)
+    cur = current_name()
+    for name, entry in sorted(hosts.items()):
+        session, state = session_state(name, entry)
+        if state == "live":
+            status = "connected, %s left" % human_duration(session["expires_at"] - time.time())
+        else:
+            status = "-"
+        marker = "*" if name == cur and state == "live" else " "
+        line = "%s %-*s  %-28s  %s" % (marker, width, name, describe(entry), status)
+        if entry.get("description"):
+            line += "  # " + entry["description"]
+        print(line)
+    return 0
+
+
+def cmd_connect(args) -> int:
+    name = args.name
+    host = get_host(name)
+    ensure_dirs()
+    ttl = args.ttl if args.ttl is not None else DEFAULT_TTL
+    if ttl <= 0:
+        die("--ttl must be positive")
+
+    session, state = session_state(name, host)
+    if state == "live" and not args.restart:
+        info("reusing session for %s (%s left)"
+             % (name, human_duration(session["expires_at"] - time.time())))
+    else:
+        reap(name, host)
+        if state == "live" and args.restart:
+            stop_master(name, host)
+            clear_session(name)
+        cmd = (["ssh", "-N", "-f"] + ssh_flags(name, host, master=True, ttl=ttl)
+               + [destination(host)])
+        rc = subprocess.run(cmd).returncode
+        if rc != 0:
+            die("failed to open connection to %s (ssh exited %d)" % (describe(host), rc), rc)
+        now = time.time()
+        session = {
+            "id": uuid.uuid4().hex,
+            "name": name,
+            "destination": destination(host),
+            "started_at": now,
+            "expires_at": now + ttl,
+            "ttl": ttl,
+        }
+        write_session(name, session)
+        schedule_expiry(name, session)
+        info("connected to %s (expires in %s)" % (describe(host), human_duration(ttl)))
+
+    set_current(name)
+    if args.detach:
+        print(name)
+        return 0
+    return attach_shell(name, host)
+
+
+def attach_shell(name: str, host: dict) -> int:
+    """Replace this process with an interactive shell - same tab, no subprocess."""
+    argv = ["ssh", "-t"] + ssh_flags(name, host) + [destination(host)]
+    sys.stderr.flush()
+    sys.stdout.flush()
+    os.execvp("ssh", argv)  # never returns
+    return 0  # pragma: no cover
+
+
+def cmd_terminal(args) -> int:
+    name = resolve_target(args.name)
+    host = get_host(name)
+    require_live(name, host)
+    set_current(name)
+    return attach_shell(name, host)
+
+
+def cmd_exec(args) -> int:
+    name = resolve_target(args.target)
+    host = get_host(name)
+    require_live(name, host)
+    command = args.command
+    if command and command[0] == "--":
+        command = command[1:]
+    if not command:
+        die("nothing to execute - usage: zssh exec [-t <target>] <command>")
+    remote = command[0] if len(command) == 1 else shlex.join(command)
+    argv = ["ssh"] + ssh_flags(name, host)
+    if args.tty:
+        argv.append("-t")
+    argv += [destination(host), "--", remote]
+    return subprocess.run(argv).returncode
+
+
+def cmd_close(args) -> int:
+    hosts = load_hosts()
+    if args.all:
+        names = [n for n, h in hosts.items() if session_state(n, h)[1] != "none"]
+        if not names:
+            info("no active sessions")
+            return 0
+    else:
+        names = [resolve_target(args.name)]
+    for name in names:
+        host = get_host(name)
+        stop_master(name, host)
+        clear_session(name)
+        print("closed %s" % name)
+    return 0
+
+
+def cmd_status(args) -> int:
+    hosts = load_hosts()
+    names = [args.name] if args.name else sorted(hosts)
+    rows = []
+    for name in names:
+        host = get_host(name)
+        session, state = session_state(name, host)
+        row = {"name": name, "destination": describe(host), "status": state}
+        if session and state == "live":
+            row["connected_for"] = human_duration(time.time() - session["started_at"])
+            row["expires_in"] = human_duration(session["expires_at"] - time.time())
+            row["expires_at"] = session["expires_at"]
+        rows.append(row)
+    live = [r for r in rows if r["status"] == "live"]
+    if args.json:
+        print(json.dumps(live if not args.name else rows, indent=2, sort_keys=True))
+        return 0 if (live or args.name) else 1
+    if not live and not args.name:
+        print("no active sessions")
+        return 1
+    for row in (rows if args.name else live):
+        if row["status"] == "live":
+            print("%s  %s  connected %s ago, expires in %s"
+                  % (row["name"], row["destination"], row["connected_for"], row["expires_in"]))
+        else:
+            print("%s  %s  not connected" % (row["name"], row["destination"]))
+    return 0
+
+
+def cmd_expire(args) -> int:
+    """Hidden watchdog: sleep until the TTL, then close that exact session."""
+    while True:
+        session = read_session(args.name)
+        if not session or session.get("id") != args.session_id:
+            return 0  # superseded or already closed
+        remaining = session["expires_at"] - time.time()
+        if remaining <= 0:
+            break
+        time.sleep(min(remaining, 60))
+    hosts = load_hosts()
+    host = hosts.get(args.name)
+    if host:
+        stop_master(args.name, host)
+    clear_session(args.name)
+    return 0
+
+
+def cmd_path(args) -> int:
+    print(hosts_file())
+    return 0
+
+
+# --------------------------------------------------------------------------
+# cli
+# --------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="zssh",
+        description="Named, persistent SSH sessions for humans and AI agents.",
+    )
+    parser.add_argument("-V", "--version", action="version", version="zssh " + VERSION)
+    sub = parser.add_subparsers(dest="cmd", metavar="<command>")
+
+    p = sub.add_parser("add", help="add or update a target")
+    p.add_argument("name")
+    p.add_argument("destination", help="[user@]host[:port]")
+    p.add_argument("-u", "--user")
+    p.add_argument("-p", "--port", type=int)
+    p.add_argument("-i", "--identity", help="path to a private key")
+    p.add_argument("-o", "--option", action="append", metavar="KEY=VALUE",
+                   help="extra ssh -o option (repeatable)")
+    p.add_argument("-d", "--description")
+    p.add_argument("-f", "--force", action="store_true")
+    p.set_defaults(func=cmd_add)
+
+    p = sub.add_parser("remove", aliases=["rm"], help="remove a target (closes it first)")
+    p.add_argument("name")
+    p.set_defaults(func=cmd_remove)
+
+    p = sub.add_parser("list", aliases=["ls"], help="list targets and their session state")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_list)
+
+    p = sub.add_parser("connect", help="open a persistent session and a shell in this tab")
+    p.add_argument("name")
+    p.add_argument("--ttl", type=int, metavar="SECONDS",
+                   help="session lifetime (default %d)" % DEFAULT_TTL)
+    p.add_argument("--detach", action="store_true",
+                   help="just open the session, do not start a shell")
+    p.add_argument("--restart", action="store_true",
+                   help="tear down an existing session first")
+    p.set_defaults(func=cmd_connect)
+
+    p = sub.add_parser("terminal", aliases=["term"],
+                       help="open a shell on a connected target, in this tab")
+    p.add_argument("name", nargs="?")
+    p.set_defaults(func=cmd_terminal)
+
+    p = sub.add_parser("exec", help="run a command on a connected target")
+    p.add_argument("-t", "--target")
+    p.add_argument("--tty", action="store_true", help="allocate a remote tty")
+    p.add_argument("command", nargs=argparse.REMAINDER)
+    p.set_defaults(func=cmd_exec)
+
+    p = sub.add_parser("close", help="close a session")
+    p.add_argument("name", nargs="?")
+    p.add_argument("-a", "--all", action="store_true")
+    p.set_defaults(func=cmd_close)
+
+    p = sub.add_parser("status", help="show active sessions")
+    p.add_argument("name", nargs="?")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser("config-path", help="print the config file path")
+    p.set_defaults(func=cmd_path)
+
+    p = sub.add_parser("__expire")  # internal watchdog, intentionally undocumented
+    p.add_argument("name")
+    p.add_argument("session_id")
+    p.set_defaults(func=cmd_expire)
+
+    return parser
+
+
+def main(argv=None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not getattr(args, "func", None):
+        parser.print_help()
+        return 1
+    try:
+        return args.func(args)
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
